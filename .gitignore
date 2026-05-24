@@ -1,0 +1,30 @@
+# Claude Code local state
+.claude/
+
+# Large class materials — not needed at runtime
+ProjectDescriptions/
+
+# Data downloaded by torchvision at runtime
+cifar100_data/
+cifar10_data/
+
+# Pipeline outputs
+checkpoints/
+submissions/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# OS / editor metadata
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
