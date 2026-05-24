@@ -11,6 +11,12 @@ cifar10_data/
 # Pipeline outputs
 checkpoints/
 submissions/
+runlogs/
+
+# HF-pulled data (cluster-only, never committed)
+target_model/*.safetensors
+target_model/*.json
+suspect_models/*.safetensors
 
 # Python artifacts
 __pycache__/

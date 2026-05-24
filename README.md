@@ -16,32 +16,46 @@ the 512-D penultimate feature. We rank-normalize every sub-feature across the
 360 suspects, average within each signal group, then rank-average across the
 four groups to produce the final score.
 
-## Reproduce the leaderboard submission
+## Reproduce on the CISPA HPC cluster (the supported path)
+
+The cluster has no `git-lfs`, so we fetch the safetensors via plain HTTP from
+the HF model repo. Everything below is committed in `cluster/`; on the cluster
+you only need `git pull` + four commands.
 
 ```bash
-# 1. clone + pull LFS weights (~16 GB total: 360 × ~45 MB suspects + target)
-git clone <repo>
-cd tml26_task2
-git lfs pull
+ssh <atml_teamXXX>@conduit2.hpc.uni-saarland.de
+cd ~ && git clone https://github.com/Rhakim9374/tml-task2.git code && cd code
 
-# 2. install deps
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+# 1. download target + 360 suspect safetensors (~16 GB, ~10-20 min, idempotent)
+bash cluster/fetch_data.sh
 
-# 3. extract per-suspect features (1 forward pass per suspect over ~65k probes)
-python -m scripts.extract_signals \
-    --device cuda \
-    --batch-size 512 \
-    --out checkpoints/features.csv
+# 2. install deps + smoke test on 3 suspects (~2 min total)
+condor_submit cluster/setup.sub        # note the ClusterId it prints
+condor_q                                # wait until done (Idle → Running → gone)
+cat runlogs/setup.<ClusterId>.out       # expect: "SETUP OK"
 
-# 4. combine to a single score and write submissions/submission.csv
-python -m scripts.combine_and_submit \
-    --features checkpoints/features.csv \
-    --out submissions/submission.csv
+# 3. full extract + combine (~1 h on V100)
+condor_submit cluster/extract.sub
+condor_q
+tail -f runlogs/extract.<ClusterId>.out
 
-# 5. upload (60-min cooldown between successful submissions)
+# 4. submit to leaderboard
 export TML_API_KEY=<your key>
 python -m scripts.submit --file submissions/submission.csv
+```
+
+If a `condor_q` shows the job `Held`, run `condor_q -hold <id>` for the reason.
+
+## Reproduce locally (laptop, no cluster)
+
+```bash
+git clone https://github.com/Rhakim9374/tml-task2.git && cd tml-task2
+# manually drop target_model/ and suspect_models/ alongside the repo
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python -m scripts.extract_signals    --device cuda --batch-size 512 --out checkpoints/features.csv
+python -m scripts.combine_and_submit --features checkpoints/features.csv  --out submissions/submission.csv
+TML_API_KEY=<key> python -m scripts.submit --file submissions/submission.csv
 ```
 
 ## Repository layout
@@ -59,6 +73,10 @@ scripts/
   extract_signals.py         one GPU pass per suspect; writes features.csv
   combine_and_submit.py      rank-average within and across signal groups
   submit.py                  POST submission.csv to the leaderboard
+cluster/
+  fetch_data.sh              HTTP download of target + 360 suspects (no git-lfs)
+  run_setup.sh / setup.sub   one-off HTCondor job: pip install + smoke test
+  run_extract.sh / extract.sub  HTCondor job: full extract + combine (~1 h)
 target_model/
   weights.safetensors        ResNet-18 target (LFS)
   train_main_idx.json        40k CIFAR-100 indices the target was trained on
