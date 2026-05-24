@@ -26,23 +26,30 @@ you only need `git pull` + four commands.
 ssh <atml_teamXXX>@conduit2.hpc.uni-saarland.de
 cd ~ && git clone https://github.com/Rhakim9374/tml-task2.git code && cd code
 
-# 1. download target + 360 suspect safetensors (~16 GB, ~10-20 min, idempotent)
-bash cluster/fetch_data.sh
+# 1. download target + 360 suspects in parallel (~16 GB, ~5 min, idempotent)
+bash cluster/fetch_data.sh                # tune with PARALLEL=N env var (default 16)
 
 # 2. install deps + smoke test on 3 suspects (~2 min total)
-condor_submit cluster/setup.sub        # note the ClusterId it prints
-condor_q                                # wait until done (Idle → Running → gone)
-cat runlogs/setup.<ClusterId>.out       # expect: "SETUP OK"
+condor_submit cluster/setup.sub
+condor_q                                  # wait until done
+cat runlogs/setup.<ClusterId>.out         # expect: "SETUP OK"
 
-# 3. full extract + combine (~1 h on V100)
-condor_submit cluster/extract.sub
+# 3. sharded full extract — 12 GPU jobs, each handling 30 suspects (~5 min/shard)
+condor_submit cluster/extract.sub         # queues 12 jobs (one per shard)
 condor_q
-tail -f runlogs/extract.<ClusterId>.out
+tail -f runlogs/shard.<ClusterId>.0.out   # follow shard 0 (others log analogously)
 
-# 4. submit to leaderboard
+# 4. once all 12 shards are done, merge and write submission.csv
+bash cluster/combine.sh
+
+# 5. submit to leaderboard
 export TML_API_KEY=<your key>
 python -m scripts.submit --file submissions/submission.csv
 ```
+
+To use more GPUs in parallel: edit `cluster/extract.sub` and change both the
+second arg of `arguments` (the `12`) and `queue 12` to your N. 360 must be
+divisible by N for even partition. Useful values: 12, 18, 20, 24, 30, 36.
 
 If a `condor_q` shows the job `Held`, run `condor_q -hold <id>` for the reason.
 
@@ -74,9 +81,10 @@ scripts/
   combine_and_submit.py      rank-average within and across signal groups
   submit.py                  POST submission.csv to the leaderboard
 cluster/
-  fetch_data.sh              HTTP download of target + 360 suspects (no git-lfs)
-  run_setup.sh / setup.sub   one-off HTCondor job: pip install + smoke test
-  run_extract.sh / extract.sub  HTCondor job: full extract + combine (~1 h)
+  fetch_data.sh              parallel HTTP download of target + 360 suspects
+  run_setup.sh / setup.sub   HTCondor job: pip install + 3-suspect smoke test
+  run_shard.sh / extract.sub HTCondor job array: N GPU shards over the 360 suspects
+  combine.sh                 login-node: merge all features_shard_*.csv → submission.csv
 target_model/
   weights.safetensors        ResNet-18 target (LFS)
   train_main_idx.json        40k CIFAR-100 indices the target was trained on

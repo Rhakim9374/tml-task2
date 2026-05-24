@@ -72,8 +72,18 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
-    df = pd.read_csv(args.features)
+    # --features may be a single path or a glob (e.g., "checkpoints/features_shard_*.csv")
+    if any(c in args.features for c in "*?["):
+        from glob import glob
+        paths = sorted(glob(args.features))
+        if not paths:
+            raise FileNotFoundError(f"no files match {args.features}")
+        df = pd.concat([pd.read_csv(p) for p in paths], ignore_index=True)
+        print(f"[combine] read {len(df)} rows from {len(paths)} shard files")
+    else:
+        df = pd.read_csv(args.features)
     assert "suspect_id" in df.columns, "features.csv missing suspect_id"
+    df = df.drop_duplicates(subset="suspect_id", keep="last")
     df = df.sort_values("suspect_id").reset_index(drop=True)
 
     selected_groups = [g.strip() for g in args.groups.split(",") if g.strip()]

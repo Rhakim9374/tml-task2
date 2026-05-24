@@ -71,7 +71,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target-path", default="target_model/weights.safetensors")
     p.add_argument("--target-dir", default="target_model")
     p.add_argument("--suspects-dir", default="suspect_models")
-    p.add_argument("--num-suspects", type=int, default=360)
+    p.add_argument("--num-suspects", type=int, default=360,
+                   help="upper bound on suspect index (used when --end is not given)")
+    p.add_argument("--start", type=int, default=0,
+                   help="first suspect index to process (inclusive)")
+    p.add_argument("--end", type=int, default=None,
+                   help="one past the last suspect index to process; default = --num-suspects")
     p.add_argument("--data-root", default="./cifar100_data")
     p.add_argument("--ood-root", default="./cifar10_data")
     p.add_argument("--ood-n", type=int, default=5000)
@@ -128,8 +133,11 @@ def main():
     target.to(device)
     target.eval()
 
+    end = args.end if args.end is not None else args.num_suspects
+    print(f"[range] processing suspects [{args.start}, {end})")
+
     rows: list[dict] = []
-    for i in range(args.num_suspects):
+    for i in range(args.start, end):
         path = Path(args.suspects_dir) / f"suspect_{i:03d}.safetensors"
         t_susp = time.time()
         suspect = load_weights(str(path), device=device)
@@ -170,7 +178,7 @@ def main():
         if device != "cpu":
             torch.cuda.empty_cache()
 
-        if (i + 1) % 10 == 0 or i == args.num_suspects - 1:
+        if (i + 1) % 10 == 0 or i == end - 1:
             dt = time.time() - t_susp
             df_partial = pd.DataFrame(rows)
             df_partial.to_csv(args.out, index=False)
