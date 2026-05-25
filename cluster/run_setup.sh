@@ -11,11 +11,10 @@ cd "$CODE_DIR"
 WORK_DIR="${_CONDOR_SCRATCH_DIR:-/tmp}/tml-task2-smoke"
 mkdir -p "$WORK_DIR/suspect_models"
 
-BASE="https://huggingface.co/SprintML/tml26_task2/resolve/main"
-for i in 000 001 002; do
-    wget -q --tries=5 "$BASE/suspect_models/suspect_${i}.safetensors" \
-         -O "$WORK_DIR/suspect_models/suspect_${i}.safetensors"
-done
+# Docker image has no wget; use stdlib urllib via cluster/dl_suspects.py.
+python3 cluster/dl_suspects.py \
+    --start 0 --end 3 \
+    --out-dir "$WORK_DIR/suspect_models"
 
 pip install --quiet -r requirements.txt
 

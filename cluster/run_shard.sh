@@ -23,16 +23,11 @@ WORK_DIR="${_CONDOR_SCRATCH_DIR:-/tmp}/tml-task2-shard-${SHARD_IDX}"
 mkdir -p "$WORK_DIR/suspect_models"
 echo "WORK_DIR=$WORK_DIR  (free: $(df -h "$WORK_DIR" | tail -1 | awk '{print $4}'))"
 
-# Download only this shard's slice of suspects (~30 × 45 MB ≈ 1.4 GB)
-BASE="https://huggingface.co/SprintML/tml26_task2/resolve/main"
-for i in $(seq -f "%03g" "$START" $((END - 1))); do
-    dst="$WORK_DIR/suspect_models/suspect_${i}.safetensors"
-    if [ ! -s "$dst" ]; then
-        wget -q --tries=5 "$BASE/suspect_models/suspect_${i}.safetensors" -O "$dst" \
-            || { rm -f "$dst"; echo "FAILED: $i" >&2; exit 1; }
-    fi
-done
-echo "downloaded $(ls "$WORK_DIR/suspect_models" | wc -l) suspects for shard $SHARD_IDX"
+# Download only this shard's slice of suspects (~30 × 45 MB ≈ 1.4 GB).
+# Docker image has no wget; use stdlib urllib via cluster/dl_suspects.py.
+python3 cluster/dl_suspects.py \
+    --start "$START" --end "$END" \
+    --out-dir "$WORK_DIR/suspect_models"
 
 pip install --quiet -r requirements.txt
 
