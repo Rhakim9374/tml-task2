@@ -22,24 +22,30 @@ The cluster has no `git-lfs`, so we fetch the safetensors via plain HTTP from
 the HF model repo. Everything below is committed in `cluster/`; on the cluster
 you only need `git pull` + four commands.
 
+Persistent state is kept tiny (~400 MB target + CIFAR) so it fits under HPC
+per-user quotas. The 16 GB of suspect safetensors is never persisted: each
+GPU shard downloads its own 30 suspects into the container's ephemeral
+`/tmp` (or `$_CONDOR_SCRATCH_DIR`) at job start, runs extract, and the data
+disappears when the container exits.
+
 ```bash
 ssh <atml_teamXXX>@conduit2.hpc.uni-saarland.de
 cd ~ && git clone https://github.com/Rhakim9374/tml-task2.git code && cd code
 
-# 1. download target + 360 suspects in parallel (~16 GB, ~5 min, idempotent)
-bash cluster/fetch_data.sh                # tune with PARALLEL=N env var (default 16)
+# 1. download target + CIFAR (~400 MB; suspects are fetched per-shard at run time)
+bash cluster/fetch_data.sh
 
-# 2. install deps + smoke test on 3 suspects (~2 min total)
+# 2. smoke test — downloads 3 suspects to /tmp inside docker, runs extract no-align no-ood
 condor_submit cluster/setup.sub
-condor_q                                  # wait until done
+condor_q
 cat runlogs/setup.<ClusterId>.out         # expect: "SETUP OK"
 
-# 3. sharded full extract — 12 GPU jobs, each handling 30 suspects (~5 min/shard)
-condor_submit cluster/extract.sub         # queues 12 jobs (one per shard)
+# 3. sharded full extract — 12 GPU jobs, each one downloads its 30 suspects then runs
+condor_submit cluster/extract.sub         # queues 12 jobs
 condor_q
-tail -f runlogs/shard.<ClusterId>.0.out   # follow shard 0 (others log analogously)
+tail -f runlogs/shard.<ClusterId>.0.out
 
-# 4. once all 12 shards are done, merge and write submission.csv
+# 4. once all 12 shards finish, merge and write submission.csv
 bash cluster/combine.sh
 
 # 5. submit to leaderboard
@@ -49,7 +55,7 @@ python -m scripts.submit --file submissions/submission.csv
 
 To use more GPUs in parallel: edit `cluster/extract.sub` and change both the
 second arg of `arguments` (the `12`) and `queue 12` to your N. 360 must be
-divisible by N for even partition. Useful values: 12, 18, 20, 24, 30, 36.
+divisible by N. Useful values: 12, 18, 20, 24, 30, 36.
 
 If a `condor_q` shows the job `Held`, run `condor_q -hold <id>` for the reason.
 
@@ -81,9 +87,10 @@ scripts/
   combine_and_submit.py      rank-average within and across signal groups
   submit.py                  POST submission.csv to the leaderboard
 cluster/
-  fetch_data.sh              parallel HTTP download of target + 360 suspects
-  run_setup.sh / setup.sub   HTCondor job: pip install + 3-suspect smoke test
-  run_shard.sh / extract.sub HTCondor job array: N GPU shards over the 360 suspects
+  fetch_data.sh              HTTP download of target + CIFAR only (no suspects)
+  run_setup.sh / setup.sub   HTCondor job: smoke test (3 suspects fetched to /tmp)
+  run_shard.sh / extract.sub HTCondor job array: each shard fetches its 30 suspects
+                             to ephemeral /tmp then runs extract on them
   combine.sh                 login-node: merge all features_shard_*.csv → submission.csv
 target_model/
   weights.safetensors        ResNet-18 target (LFS)
