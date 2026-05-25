@@ -148,6 +148,12 @@ def _best_perm(corr: np.ndarray) -> np.ndarray:
     Returns array `perm` where perm[i] gives the suspect channel index assigned
     to target channel i. Equivalently, suspect_weights_aligned[i] = suspect_weights[perm[i]].
     """
+    if not np.all(np.isfinite(corr)):
+        # Dead/quantized channels can give 0/0 correlations → NaN. Treat those
+        # cells as "no information" (corr=0); the Hungarian then assigns them
+        # to whatever leftover slot, which is fine since their downstream
+        # contribution is also ~0.
+        corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
     row_ind, col_ind = linear_sum_assignment(-corr)
     # row_ind is just np.arange when corr is square; col_ind is the chosen suspect channel per target row
     assert np.all(row_ind == np.arange(corr.shape[0]))

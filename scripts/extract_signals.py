@@ -140,41 +140,53 @@ def main():
     for i in range(args.start, end):
         path = Path(args.suspects_dir) / f"suspect_{i:03d}.safetensors"
         t_susp = time.time()
-        suspect = load_weights(str(path), device=device)
+        try:
+            suspect = load_weights(str(path), device=device)
 
-        # === forward suspect on all loaders → logits ===
-        susp_logits = {}
-        for split, loader in loaders.items():
-            susp_logits[split] = forward_logits(suspect, loader, device)
+            # === forward suspect on all loaders → logits ===
+            susp_logits = {}
+            for split, loader in loaders.items():
+                susp_logits[split] = forward_logits(suspect, loader, device)
 
-        # === S1 output agreement ===
-        s1 = {}
-        for split in loaders.keys():
-            s1.update(agreement_features(target_logits[split], susp_logits[split], prefix=split))
+            # === S1 output agreement ===
+            s1 = {}
+            for split in loaders.keys():
+                s1.update(agreement_features(target_logits[split], susp_logits[split], prefix=split))
 
-        # === S2 dataset inference ===
-        s2_per = {}
-        for split in ["train", "holdout", "test"]:
-            s2_per.update(split_features(susp_logits[split], labels[split], prefix=split))
-        s2 = {**s2_per, **gap_features(s2_per)}
+            # === S2 dataset inference ===
+            s2_per = {}
+            for split in ["train", "holdout", "test"]:
+                s2_per.update(split_features(susp_logits[split], labels[split], prefix=split))
+            s2 = {**s2_per, **gap_features(s2_per)}
 
-        # === S4 CKA (pristine suspect — do BEFORE alignment mutation) ===
-        s4 = cka_features(target, suspect, cka_probe, device)
+            # === S4 CKA (pristine suspect — do BEFORE alignment mutation) ===
+            s4 = cka_features(target, suspect, cka_probe, device)
 
-        # === S3 weight features ===
-        s3 = {}
-        s3.update(raw_weight_features(target, suspect))
-        s3.update(svd_spectrum_distance(target, suspect))
-        if not args.no_align:
-            # mutates suspect in place
-            suspect = align_suspect_to_target(target, suspect, align_probe, device)
-            s3.update(aligned_weight_features(target, suspect))
+            # === S3 weight features ===
+            s3 = {}
+            s3.update(raw_weight_features(target, suspect))
+            s3.update(svd_spectrum_distance(target, suspect))
+            if not args.no_align:
+                try:
+                    # mutates suspect in place
+                    suspect = align_suspect_to_target(target, suspect, align_probe, device)
+                    s3.update(aligned_weight_features(target, suspect))
+                except Exception as e:
+                    print(f"[suspect {i:3d}] alignment failed ({e}); "
+                          f"falling back to raw weights for perm features", flush=True)
+                    s3["s3_perm_l2"] = s3["s3_raw_l2"]
+                    s3["s3_perm_cos"] = s3["s3_raw_cos"]
 
-        row = {"suspect_id": i, **s1, **s2, **s3, **s4}
-        rows.append(row)
+            row = {"suspect_id": i, **s1, **s2, **s3, **s4}
+            rows.append(row)
+        except Exception as e:
+            print(f"[suspect {i:3d}] FAILED ({type(e).__name__}: {e}); skipping", flush=True)
 
         # free suspect from GPU before loading the next
-        del suspect
+        try:
+            del suspect
+        except NameError:
+            pass
         if device != "cpu":
             torch.cuda.empty_cache()
 

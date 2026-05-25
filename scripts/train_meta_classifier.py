@@ -60,10 +60,19 @@ def main() -> None:
     labels_df = pd.read_csv(args.shadow_labels)
     labels_df = labels_df.sort_values("suspect_id").reset_index(drop=True)
 
-    if len(shadow_df) != len(labels_df):
-        raise RuntimeError(f"shadow feature rows ({len(shadow_df)}) != label rows ({len(labels_df)})")
-    if not (shadow_df["suspect_id"].values == labels_df["suspect_id"].values).all():
-        raise RuntimeError("shadow suspect_id mismatch between features and labels")
+    # Inner-join on suspect_id so suspects that failed during extract just
+    # get dropped (rather than killing the whole run).
+    common_ids = sorted(set(shadow_df["suspect_id"]) & set(labels_df["suspect_id"]))
+    missing_feat = sorted(set(labels_df["suspect_id"]) - set(shadow_df["suspect_id"]))
+    missing_lbl = sorted(set(shadow_df["suspect_id"]) - set(labels_df["suspect_id"]))
+    if missing_feat:
+        print(f"[warn] {len(missing_feat)} shadow suspect(s) lack features "
+              f"(probably failed during extract): {missing_feat}")
+    if missing_lbl:
+        print(f"[warn] {len(missing_lbl)} shadow suspect(s) lack labels: {missing_lbl}")
+    shadow_df = shadow_df[shadow_df["suspect_id"].isin(common_ids)].sort_values("suspect_id").reset_index(drop=True)
+    labels_df = labels_df[labels_df["suspect_id"].isin(common_ids)].sort_values("suspect_id").reset_index(drop=True)
+    print(f"using {len(common_ids)} shadow suspects with both features and labels")
 
     # Per-kind feature evolution: shows how each derivation type changes each
     # signal, so we can sanity-check that the pipeline behaves as expected.
