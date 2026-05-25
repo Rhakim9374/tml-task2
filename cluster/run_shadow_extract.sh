@@ -17,6 +17,14 @@ TOTAL=$3
 START=$(( SHARD_IDX * TOTAL / NUM_SHARDS ))
 END=$(( (SHARD_IDX + 1) * TOTAL / NUM_SHARDS ))
 
+# Backward-compat: an earlier build_shadow_jobs.py named shadow outputs
+# shadow_NNN.safetensors, but extract_signals.py expects suspect_NNN. Rename
+# any legacy files in place; idempotent — no-op for fresh runs.
+for f in shadows/suspects/shadow_*.safetensors; do
+    [ -e "$f" ] || continue
+    mv "$f" "${f/shadow_/suspect_}"
+done
+
 pip install --quiet -r requirements.txt
 
 python -m scripts.extract_signals \

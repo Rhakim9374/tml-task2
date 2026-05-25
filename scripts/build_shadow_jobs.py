@@ -33,7 +33,8 @@ SUSPECTS_DIR = "shadows/suspects"
 
 
 def shadow_out(idx: int) -> str:
-    return f"{SUSPECTS_DIR}/shadow_{idx:03d}.safetensors"
+    # extract_signals.py hardcodes `suspect_NNN.safetensors`, so we match that.
+    return f"{SUSPECTS_DIR}/suspect_{idx:03d}.safetensors"
 
 
 def make_independent(idx: int, seed: int, epochs: int) -> dict:
