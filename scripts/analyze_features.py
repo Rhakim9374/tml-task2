@@ -98,7 +98,7 @@ def main() -> None:
         if len(cols) < 2:
             continue
         print(f"\n[{g}] {len(cols)} features")
-        corr = df[cols].corr(method="spearman")
+        corr = df[cols].rank().corr()
         for c in cols:
             others = [x for x in cols if x != c]
             mean_to_group = corr.loc[c, others].mean()
@@ -113,15 +113,16 @@ def main() -> None:
         if cols:
             group_scores[g] = pd.DataFrame({c: rank_norm(df[c]) for c in cols}).mean(axis=1)
     gs_df = pd.DataFrame(group_scores)
-    print(gs_df.corr(method="spearman").round(3).to_string())
+    print(gs_df.rank().corr().round(3).to_string())
 
     # 4) Single-feature ensemble correlation to the full ensemble
     full_score = ensemble(df, list(GROUPS.keys()))
     print("\n=== EACH FEATURE'S CORR WITH FULL ENSEMBLE SCORE ===")
     print("(negative ⇒ that feature is *fighting* the ensemble)")
+    full_rank = full_score.rank()
     rho_rows = []
     for c in feat_cols:
-        rho = df[c].corr(full_score, method="spearman")
+        rho = df[c].rank().corr(full_rank)
         rho_rows.append((c, rho))
     for c, rho in sorted(rho_rows, key=lambda x: x[1]):
         flag = " ⚠ NEGATIVE" if rho < 0 else ""
