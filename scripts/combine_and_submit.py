@@ -67,6 +67,25 @@ def parse_args() -> argparse.Namespace:
         default="S1,S2,S3,S4",
         help="comma-separated subset of groups to include in the ensemble",
     )
+    p.add_argument(
+        "--mode",
+        choices=["mean", "max", "temperature"],
+        default="mean",
+        help="how to combine across groups: equal/weighted mean, max of ranks, "
+             "or per-suspect temperature-softmax (emphasises confident high ranks)",
+    )
+    p.add_argument(
+        "--group-weights",
+        default=None,
+        help="for mode=mean: per-group weights, e.g. 'S1=1.5,S2=0.3,S3=1.0,S4=1.5'. "
+             "Missing groups default to 1.0. Ignored for mode=max.",
+    )
+    p.add_argument(
+        "--temperature",
+        type=float,
+        default=3.0,
+        help="for mode=temperature: beta in exp(beta * (rank - 0.5)); larger → more max-like",
+    )
     return p.parse_args()
 
 
@@ -104,9 +123,36 @@ def main():
     if not group_scores:
         raise RuntimeError("no signal groups available — re-run extract_signals.py")
 
-    # rank-average across groups so each group has equal weight
+    # rank-average across groups (each group has equal weight by default)
     group_rank_df = pd.DataFrame({g: rank_norm(s) for g, s in group_scores.items()})
-    final_score = group_rank_df.mean(axis=1)
+
+    if args.mode == "max":
+        final_score = group_rank_df.max(axis=1)
+        print(f"[mode] max over groups: {list(group_rank_df.columns)}")
+    elif args.mode == "temperature":
+        import numpy as np
+        ranks = group_rank_df.values
+        w = np.exp(args.temperature * (ranks - 0.5))
+        final_score = pd.Series((w * ranks).sum(axis=1) / w.sum(axis=1),
+                                index=group_rank_df.index)
+        print(f"[mode] temperature={args.temperature} over groups: "
+              f"{list(group_rank_df.columns)}")
+    else:  # mean
+        if args.group_weights:
+            weights = {g: 1.0 for g in group_rank_df.columns}
+            for spec in args.group_weights.split(","):
+                if "=" not in spec:
+                    raise ValueError(f"bad --group-weights spec: {spec!r}")
+                g, w = spec.split("=")
+                weights[g.strip()] = float(w)
+            total = sum(weights[g] for g in group_rank_df.columns)
+            final_score = sum(weights[g] * group_rank_df[g]
+                              for g in group_rank_df.columns) / total
+            print(f"[mode] weighted mean: " +
+                  ", ".join(f"{g}={weights[g]}" for g in group_rank_df.columns))
+        else:
+            final_score = group_rank_df.mean(axis=1)
+            print(f"[mode] equal mean over groups: {list(group_rank_df.columns)}")
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     out_df = pd.DataFrame({"id": df["suspect_id"].astype(int), "score": final_score.astype(float)})
