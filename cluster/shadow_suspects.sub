@@ -1,0 +1,17 @@
+universe       = docker
+docker_image   = pytorch/pytorch:2.3.1-cuda12.1-cudnn8-devel
+executable     = /bin/bash
+arguments      = /home/$ENV(USER)/code/cluster/run_shadow_job.sh $(Process)
+output         = runlogs/shadow_job.$(ClusterId).$(Process).out
+error          = runlogs/shadow_job.$(ClusterId).$(Process).err
+log            = runlogs/shadow_job.$(ClusterId).log
+should_transfer_files = YES
+request_GPUs   = 1
+request_CPUs   = 4
+request_memory = 16G
+requirements   = UidDomain == "cs.uni-saarland.de"
++WantGPUHomeMounted = true
++WantScratchMounted = true
+# 40 shadow suspects = 20 indep + 5 noise + 5 quant + 5 fine-tune + 5 distill
+# (matches default args of scripts/build_shadow_jobs.py)
+queue 40

@@ -18,6 +18,9 @@ target_model/*.safetensors
 target_model/*.json
 suspect_models/*.safetensors
 
+# Shadow models (cluster-trained, never committed; ~3 GB)
+shadows/
+
 # Python artifacts
 __pycache__/
 *.py[cod]
