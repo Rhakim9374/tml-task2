@@ -1,7 +1,8 @@
 """CIFAR-style ResNet-18 matching the target / suspect architecture.
 
-Mirrors `task_template.py:make_model()` exactly: torchvision resnet18 with the
-first conv replaced by a 3x3 stride-1 conv (no maxpool) and a 100-class head.
+torchvision resnet18 with the first conv replaced by a 3x3 stride-1 conv,
+the maxpool removed, and a 100-class head — the architecture every target
+and suspect uses.
 """
 
 import torch

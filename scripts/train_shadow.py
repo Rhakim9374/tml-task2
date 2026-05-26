@@ -6,7 +6,7 @@ Modes:
     distill — knowledge distillation against a teacher (--distill-target).
               Student matches teacher's softmaxed logits; no ground-truth labels.
 
-Architecture and normalization match task_template.py / submission.py exactly
+Architecture and normalization match the target's recipe exactly
 (CIFAR-style ResNet-18 with 3x3 stride-1 conv1, no maxpool, fc=100).
 """
 

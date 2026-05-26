@@ -21,11 +21,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.metrics import roc_auc_score
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--shadow-preds", default="shadows/predictions_ood.npz")
+    ap.add_argument("--shadow-preds", default="shadows/predictions.npz")
     ap.add_argument("--labels", default="shadows/labels.csv")
     ap.add_argument("--top-k", type=int, default=500)
     ap.add_argument("--min-fire-rate", type=float, default=0.05,
@@ -36,14 +37,6 @@ def main() -> None:
                          "(e.g. 'ood' or 'ood,holdout,test'). If unset, all splits used.")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
-
-    try:
-        from sklearn.metrics import roc_auc_score
-    except ImportError:
-        import sys
-        print("install sklearn first:  ~/.tml-venv/bin/pip install scikit-learn",
-              file=sys.stderr)
-        sys.exit(2)
 
     data = np.load(args.shadow_preds, allow_pickle=True)
     all_suspect_preds = data["suspect_preds"]    # [N, n_probes_total]

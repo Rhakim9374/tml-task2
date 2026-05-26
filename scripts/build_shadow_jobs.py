@@ -1,32 +1,20 @@
-"""Generate the shadow-model job plan (v4 — 200 shadows, hard-case focus).
+"""Generate the shadow-model job plan (195 shadows, hard-case focus).
 
-v3 (100 shadows) reached CV AUC ~0.99 within shadows but the meta-classifier
-still overfit on real (top-18 concentrated in IDs 0-45, statistically
-impossible if ID-independent). The diagnosis: the SHADOW DISTRIBUTION still
-didn't span the harder cases the real test set contains.
+  HARD FALSE POSITIVES (label = 0; must learn: NOT stolen)
+    50 independent       — recipe variation (aug × opt × lr × wd × ls × ep × subset)
+    25 evil_twin         — same train_main_idx as target, varied seeds AND recipes
+    15 near_target_indep — random 40k that overlaps target's 40k by ~80%
 
-v4 quadruples the focus on the hard cases:
+  HARD TRUE POSITIVES (label = 1; must learn: stolen)
+    15 fine_tune         — VERY light (1-3 ep) all the way up to heavy
+    25 partial_finetune  — fc-only / fc+layer4 / fc+layer4+layer3, varied LRs
+    30 distill           — varied T (1..32), varied transfer data
+    15 mixed_kd          — α∈{0.3,0.5,0.7} mixed KD+CE on target
 
-  HARD FALSE POSITIVES (must learn: NOT stolen)
-    50 independent  — recipe variation (aug × opt × lr × wd × ls × ep × subset)
-    25 evil_twin    — same train_main_idx as target, varied seeds AND recipes  ← was 5
-    15 near_target  — random 40k overlapping with target's 40k by ~80%, target's recipe
+  EASIER CASES (label = 1; function-preserving derivatives)
+    10 noise + 10 quant
 
-  HARD TRUE POSITIVES (must learn: stolen)
-    15 fine_tune       — VERY light (1-3 ep) all the way up to heavy
-    25 partial_finetune — fc-only / fc+layer4 / fc+layer4+layer3, varied LRs   ← was 10
-    30 distill         — varied T (1..32), varied data (cifar100, cifar10 OOD) ← was 15
-    15 mixed_kd        — α∈{0.3,0.5,0.7} mixed KD+CE on target  ← new boundary kind
-
-  EASIER CASES (still useful, less compute)
-    10 noise + 10 quant — function-preserving derivatives
-    5 distill_test     — distillation on CIFAR-100 test split (smaller transfer set)
-
-Total: 50 + 25 + 15 + 15 + 25 + 30 + 15 + 10 + 10 + 5 = 200
-
-By doubling/tripling the hard cases, the meta-classifier is forced to learn
-features that *actually* discriminate stolen vs not-stolen across the
-boundary, not just the bulk of obvious cases.
+Total: 50 + 25 + 15 + 15 + 25 + 30 + 15 + 10 + 10 = 195
 """
 
 from __future__ import annotations
@@ -358,9 +346,6 @@ def main() -> None:
                      "out": shadow_out(idx),
                      "cmd": cmd_quant(shadow_out(idx), bits=bits)})
         idx += 1
-
-    # --- 5 distill_test (already covered above implicitly; keep tag for analysis) ---
-    # (placeholders — actual jobs already in the distill section)
 
     # Write outputs
     with open(f"{args.out_dir}/jobs.json", "w") as f:

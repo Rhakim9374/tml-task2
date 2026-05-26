@@ -1,18 +1,22 @@
-"""Extract S1+S2+S3+S4 features for all 360 suspect models.
+"""Extract all per-suspect features for the meta-classifier.
 
-Pipeline (per suspect):
-  1. Forward suspect on train_main / holdout / test / OOD loaders → logits
-  2. S1: output agreement vs cached target logits on each split
-  3. S2: cross-entropy loss + accuracy + confidence + gap features
-  4. Forward suspect on a small probe batch with hooks → activations
-  5. S4: linear CKA at stem / layer1..4 / penultimate (uses pristine suspect)
-  6. S3: raw L2/cos on flat params, SVD spectrum distance, then mutate suspect
-        via activation-matched permutation and recompute L2/cos
+For each suspect we compute the following groups against the target on four
+probe splits (target's 40k train, 10k holdout, CIFAR-100 test, 5k CIFAR-10
+OOD):
 
-The target is loaded once and its logits cached. Suspects are loaded one at
-a time; mutated weights are never written back to disk.
+    S1   output agreement      (cos / -KL / -L2-prob / top-1 of logits)
+    S1f  fine-grained agreement (mistake-copy / top-{3,5} overlap / low-conf)
+    S2   dataset-inference gaps (train vs holdout vs test loss/conf)
+    S3   weight-space distance  (raw + SVD-spectrum + activation-aligned perm)
+    S4   linear CKA             (stem / layer1..4 / penultimate)
+    S5   decision boundary      (input-gradient cosine + FGSM transfer rate)
+    S6   decision-distance vec  (ModelDiff K=4 random directions)
 
-Output: checkpoints/features.csv (one row per suspect, all sub-features)
+The target is loaded once and its logits / DDV cached, then re-used for every
+suspect in the shard. Suspect weights are mutated in memory by the S3
+alignment step but never written back to disk.
+
+Output: checkpoints/features.csv (one row per suspect, all sub-features).
 """
 
 from __future__ import annotations
@@ -98,22 +102,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cka-probe-n", type=int, default=1024, help="batch size for S4 CKA")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--out", default="checkpoints/features.csv")
-    p.add_argument("--no-ood", action="store_true", help="skip OOD probe (S1 only)")
-    p.add_argument("--no-align", action="store_true", help="skip S3 permutation alignment")
-    p.add_argument("--no-grad", action="store_true",
-                   help="skip S5 input-gradient + adversarial-transfer features")
     p.add_argument("--grad-probe-n", type=int, default=256,
                    help="number of probe examples per split for S5 grad/adv features")
     p.add_argument("--grad-epsilon", type=float, default=0.06,
                    help="FGSM epsilon in normalized input space (default 0.06 ≈ 4/255 pixels)")
-    p.add_argument("--no-ddv", action="store_true",
-                   help="skip S6 decision-distance-vector features")
     p.add_argument("--ddv-probe-n", type=int, default=128,
                    help="number of probe examples per split for S6 DDV")
     p.add_argument("--ddv-K", type=int, default=4,
                    help="number of random directions per probe for S6 DDV")
     p.add_argument("--ddv-n-steps", type=int, default=8,
-                   help="number of alpha steps in S6 DDV grid (log-spaced)")
+                   help="number of alpha steps in S6 DDV grid")
     p.add_argument("--ddv-alpha-max", type=float, default=0.2,
                    help="maximum DDV perturbation magnitude in normalized input space")
     return p.parse_args()
@@ -129,15 +127,14 @@ def main():
     train_main, holdout, test = get_cifar100_splits(args.data_root, args.target_dir)
     print(f"        train_main={len(train_main)} holdout={len(holdout)} test={len(test)}")
 
+    ood = get_ood_probe(args.ood_root, args.ood_n)
+    print(f"        ood(cifar10)={len(ood)}")
     loaders = {
         "train": make_loader(train_main, args.batch_size, args.num_workers),
         "holdout": make_loader(holdout, args.batch_size, args.num_workers),
         "test": make_loader(test, args.batch_size, args.num_workers),
+        "ood": make_loader(ood, args.batch_size, args.num_workers),
     }
-    if not args.no_ood:
-        ood = get_ood_probe(args.ood_root, args.ood_n)
-        loaders["ood"] = make_loader(ood, args.batch_size, args.num_workers)
-        print(f"        ood(cifar10)={len(ood)}")
 
     # cache target logits and labels per split
     print(f"[target] loading {args.target_path}")
@@ -158,48 +155,45 @@ def main():
 
     # Per-split probe batches for S5 grad/adv features. Same examples re-used
     # across all suspects so the gradient direction comparison is consistent.
-    grad_probes: dict[str, torch.Tensor] = {}
-    if not args.no_grad:
-        print(f"[probe] gathering grad/adv probes (n={args.grad_probe_n} per split)")
-        for split, loader in loaders.items():
-            grad_probes[split] = collect_first_images(loader, args.grad_probe_n)
+    print(f"[probe] gathering grad/adv probes (n={args.grad_probe_n} per split)")
+    grad_probes: dict[str, torch.Tensor] = {
+        split: collect_first_images(loader, args.grad_probe_n)
+        for split, loader in loaders.items()
+    }
 
     # Per-split probe batches + cached target DDVs for S6. Target's DDV is
     # the same for every suspect in this shard — compute once.
-    ddv_probes: dict[str, torch.Tensor] = {}
-    ddv_directions: dict[str, torch.Tensor] = {}
+    print(f"[probe] gathering DDV probes (n={args.ddv_probe_n}, K={args.ddv_K}, "
+          f"n_steps={args.ddv_n_steps}, alpha_max={args.ddv_alpha_max})")
     ddv_alphas = torch.linspace(args.ddv_alpha_max / args.ddv_n_steps,
                                 args.ddv_alpha_max, args.ddv_n_steps,
-                                device=device) if not args.no_ddv else None
-    target_ddvs: dict[str, torch.Tensor] = {}
+                                device=device)
+    ddv_probes: dict[str, torch.Tensor] = {}
+    ddv_directions: dict[str, torch.Tensor] = {}
     target_pred_ddv: dict[str, torch.Tensor] = {}
-    if not args.no_ddv:
-        print(f"[probe] gathering DDV probes (n={args.ddv_probe_n}, K={args.ddv_K}, "
-              f"n_steps={args.ddv_n_steps}, alpha_max={args.ddv_alpha_max})")
-        for split, loader in loaders.items():
-            probe = collect_first_images(loader, args.ddv_probe_n)
-            ddv_probes[split] = probe.to(device)
-            ddv_directions[split] = make_directions(
-                probe.size(0), args.ddv_K,
-                tuple(probe.shape[1:]),
-                seed=hash(split) & 0xFFFF_FFFF,
-                device=device,
-            )
-            with torch.no_grad():
-                target_pred_ddv[split] = target(ddv_probes[split]).argmax(dim=1)
-        print(f"[target] computing DDV cache (this runs once per shard) ...")
-        t0 = time.time()
-        for split in ddv_probes:
-            target_ddvs[split] = compute_ddv(
-                target, ddv_probes[split], target_pred_ddv[split],
-                ddv_directions[split], ddv_alphas, device,
-            )
-        print(f"[target] DDV cache built in {time.time() - t0:.1f}s "
-              f"({len(target_ddvs)} splits × {args.ddv_probe_n} probes × {args.ddv_K} dirs)")
+    for split, loader in loaders.items():
+        probe = collect_first_images(loader, args.ddv_probe_n)
+        ddv_probes[split] = probe.to(device)
+        ddv_directions[split] = make_directions(
+            probe.size(0), args.ddv_K,
+            tuple(probe.shape[1:]),
+            seed=hash(split) & 0xFFFF_FFFF,
+            device=device,
+        )
+        with torch.no_grad():
+            target_pred_ddv[split] = target(ddv_probes[split]).argmax(dim=1)
+    print(f"[target] computing DDV cache (this runs once per shard) ...")
+    t0 = time.time()
+    target_ddvs: dict[str, torch.Tensor] = {
+        split: compute_ddv(
+            target, ddv_probes[split], target_pred_ddv[split],
+            ddv_directions[split], ddv_alphas, device,
+        )
+        for split in ddv_probes
+    }
+    print(f"[target] DDV cache built in {time.time() - t0:.1f}s "
+          f"({len(target_ddvs)} splits × {args.ddv_probe_n} probes × {args.ddv_K} dirs)")
 
-    # free target weights from GPU between uses to keep memory low (we keep on CPU between suspects)
-    # but for S3 alignment we re-call its forward, so keep on GPU
-    target.to(device)
     target.eval()
 
     end = args.end if args.end is not None else args.num_suspects
@@ -217,12 +211,12 @@ def main():
             for split, loader in loaders.items():
                 susp_logits[split] = forward_logits(suspect, loader, device)
 
-            # === S1 output agreement (existing) ===
+            # === S1 output agreement ===
             s1 = {}
             for split in loaders.keys():
                 s1.update(agreement_features(target_logits[split], susp_logits[split], prefix=split))
 
-            # === S1f fine-grained agreement (mistake / top-k / low-conf) ===
+            # === S1f fine-grained agreement (mistake-copy / top-k overlap / low-conf) ===
             s1f = {}
             for split in loaders.keys():
                 s1f.update(topk_overlap_features(target_logits[split], susp_logits[split], prefix=split))
@@ -243,52 +237,49 @@ def main():
 
             # === S5 decision-boundary similarity (pristine suspect) ===
             s5 = {}
-            if not args.no_grad:
-                for split, probe in grad_probes.items():
-                    try:
-                        s5.update(grad_and_adv_features(
-                            target, suspect, probe, device,
-                            prefix=split, epsilon=args.grad_epsilon))
-                    except Exception as e:
-                        print(f"[suspect {i:3d}] grad/adv on {split} failed ({e}); "
-                              f"writing 0.0 fallback", flush=True)
-                        s5[f"s5_grad_cos_{split}"] = 0.0
-                        s5[f"s5_adv_transfer_{split}"] = 0.0
+            for split, probe in grad_probes.items():
+                try:
+                    s5.update(grad_and_adv_features(
+                        target, suspect, probe, device,
+                        prefix=split, epsilon=args.grad_epsilon))
+                except Exception as e:
+                    print(f"[suspect {i:3d}] grad/adv on {split} failed ({e}); "
+                          f"writing 0.0 fallback", flush=True)
+                    s5[f"s5_grad_cos_{split}"] = 0.0
+                    s5[f"s5_adv_transfer_{split}"] = 0.0
 
             # === S6 Decision-Distance Vector similarity (uses cached target DDV) ===
             s6 = {}
-            if not args.no_ddv:
-                for split in ddv_probes:
-                    try:
-                        suspect_ddv = compute_ddv(
-                            suspect, ddv_probes[split], target_pred_ddv[split],
-                            ddv_directions[split], ddv_alphas, device,
-                        )
-                        s6.update(ddv_similarity_features(
-                            target_ddvs[split], suspect_ddv,
-                            prefix=split, alpha_max=args.ddv_alpha_max,
-                        ))
-                    except Exception as e:
-                        print(f"[suspect {i:3d}] DDV on {split} failed ({e}); "
-                              f"writing 0.0 fallback", flush=True)
-                        s6[f"s6_ddv_corr_{split}"] = 0.0
-                        s6[f"s6_ddv_cos_{split}"] = 0.0
-                        s6[f"s6_ddv_flip_agree_{split}"] = 0.0
+            for split in ddv_probes:
+                try:
+                    suspect_ddv = compute_ddv(
+                        suspect, ddv_probes[split], target_pred_ddv[split],
+                        ddv_directions[split], ddv_alphas, device,
+                    )
+                    s6.update(ddv_similarity_features(
+                        target_ddvs[split], suspect_ddv,
+                        prefix=split, alpha_max=args.ddv_alpha_max,
+                    ))
+                except Exception as e:
+                    print(f"[suspect {i:3d}] DDV on {split} failed ({e}); "
+                          f"writing 0.0 fallback", flush=True)
+                    s6[f"s6_ddv_corr_{split}"] = 0.0
+                    s6[f"s6_ddv_cos_{split}"] = 0.0
+                    s6[f"s6_ddv_flip_agree_{split}"] = 0.0
 
-            # === S3 weight features ===
+            # === S3 weight features (raw + SVD spectrum + activation-aligned permutation) ===
             s3 = {}
             s3.update(raw_weight_features(target, suspect))
             s3.update(svd_spectrum_distance(target, suspect))
-            if not args.no_align:
-                try:
-                    # mutates suspect in place
-                    suspect = align_suspect_to_target(target, suspect, align_probe, device)
-                    s3.update(aligned_weight_features(target, suspect))
-                except Exception as e:
-                    print(f"[suspect {i:3d}] alignment failed ({e}); "
-                          f"falling back to raw weights for perm features", flush=True)
-                    s3["s3_perm_l2"] = s3["s3_raw_l2"]
-                    s3["s3_perm_cos"] = s3["s3_raw_cos"]
+            try:
+                # mutates suspect in place
+                suspect = align_suspect_to_target(target, suspect, align_probe, device)
+                s3.update(aligned_weight_features(target, suspect))
+            except Exception as e:
+                print(f"[suspect {i:3d}] alignment failed ({e}); "
+                      f"falling back to raw weights for perm features", flush=True)
+                s3["s3_perm_l2"] = s3["s3_raw_l2"]
+                s3["s3_perm_cos"] = s3["s3_raw_cos"]
 
             row = {"suspect_id": i, **s1, **s1f, **s2, **s3, **s4, **s5, **s6}
             rows.append(row)

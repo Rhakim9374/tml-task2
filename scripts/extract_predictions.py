@@ -1,23 +1,26 @@
 """Save per-suspect argmax predictions on probe sets for trigger selection.
 
-We use these elsewhere (find_triggers.py) to identify boundary-trigger inputs
-— probes where 'suspect_pred == target_pred' is highly discriminative of
-stolen vs not-stolen in the shadow set. Stolen models inherit target's
-idiosyncratic prediction on those probes; independents don't.
+Used by find_triggers.py to identify boundary-trigger inputs — probes where
+'suspect_pred == target_pred' is highly discriminative of stolen vs not-stolen
+across the shadow set. Stolen models inherit the target's idiosyncratic
+prediction on those probes; independents don't.
 
 Output `.npz` file contains:
-    target_pred:    [n_probes] int64   target's argmax on the probe set
-    suspect_ids:    [N] int32          suspect IDs that succeeded
-    suspect_preds:  [N, n_probes] int64   each suspect's argmax per probe
+    target_pred:    [n_probes_total] int64   target's argmax per probe
+    suspect_ids:    [N]              int32   suspect IDs that succeeded
+    suspect_preds:  [N, n_probes_total] int64   each suspect's argmax per probe
+    split_names:    object array            ['train', 'ood', 'holdout', 'test']
+    split_offsets:  int32 array             cumulative split boundaries
 
-By default we use the CIFAR-10 OOD probe (5000 inputs) — that's the most
-discriminative split in our existing meta-classifier (top XGBoost importances
-are all OOD-based) and gives a manageable matrix size.
+The trigger pipeline runs this on both the shadow and real suspect sets with
+the same probe configuration so find_triggers can mine on shadow predictions
+and score_with_triggers can apply those probe indices to the real matrix.
 """
 
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 
 import numpy as np
@@ -77,10 +80,10 @@ def main() -> None:
     target = load_weights(args.target_path, device=args.device)
     target_pred_parts = []
     for s in splits:
-        t0 = __import__("time").time()
+        t0 = time.time()
         logits = forward_logits(target, loaders[s], args.device)
         target_pred_parts.append(logits.argmax(dim=1).numpy().astype(np.int64))
-        print(f"[target] {s}: {logits.shape} in {__import__('time').time() - t0:.1f}s")
+        print(f"[target] {s}: {logits.shape} in {time.time() - t0:.1f}s")
     target_pred = np.concatenate(target_pred_parts, axis=0)
 
     end = args.end if args.end is not None else args.num_suspects
