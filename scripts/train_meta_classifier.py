@@ -39,12 +39,24 @@ def main() -> None:
     ap.add_argument("--real-features", default="checkpoints/features_shard_*.csv")
     ap.add_argument("--out", default="submissions/submission_meta.csv")
     ap.add_argument("--n-folds", type=int, default=5)
-    # Tuned for small shadow sets (~40 samples): shallow trees, modest count, mild lr.
+    # XGBoost hyper-params — kept conservative for ~100-sample shadow sets.
     ap.add_argument("--n-estimators", type=int, default=100)
     ap.add_argument("--max-depth", type=int, default=3)
     ap.add_argument("--learning-rate", type=float, default=0.1)
     ap.add_argument("--subsample", type=float, default=0.8)
     ap.add_argument("--colsample-bytree", type=float, default=0.8)
+    ap.add_argument(
+        "--output", default="margin", choices=["proba", "margin"],
+        help="XGBoost output to write: 'proba'=sigmoid (can saturate near 0/1 → "
+             "creates rank-ties at the top); 'margin'=raw logit (smoother, "
+             "preserves order at the extremes). Default 'margin'.",
+    )
+    ap.add_argument(
+        "--also-emit-lr", action="store_true", default=True,
+        help="also fit a logistic regression and write submission_meta_lr.csv "
+             "next to --out (L2-regularized, well-calibrated, much less prone "
+             "to overfit on small shadow sets than XGBoost).",
+    )
     args = ap.parse_args()
 
     try:
@@ -55,6 +67,8 @@ def main() -> None:
         sys.exit(2)
     from sklearn.model_selection import StratifiedKFold
     from sklearn.metrics import roc_auc_score
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
 
     shadow_df = load_concat(args.shadow_features)
     labels_df = pd.read_csv(args.shadow_labels)
@@ -148,7 +162,13 @@ def main() -> None:
         verbosity=0,
     )
     final.fit(X_shadow, y_shadow)
-    scores = final.predict_proba(X_real)[:, 1]
+    if args.output == "margin":
+        # Raw logit (DMatrix → predict with output_margin=True). Preserves order
+        # without sigmoid saturation, so top-K rank stays informative.
+        dmat = xgb.DMatrix(X_real)
+        scores = final.get_booster().predict(dmat, output_margin=True)
+    else:
+        scores = final.predict_proba(X_real)[:, 1]
 
     out_df = pd.DataFrame({"id": real_df["suspect_id"].astype(int), "score": scores.astype(float)})
     out_df = out_df.sort_values("id").reset_index(drop=True)
@@ -159,11 +179,58 @@ def main() -> None:
     from pathlib import Path
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(args.out, index=False)
-    print(f"\n=== feature importances (top 15) ===")
+    print(f"\n=== XGBoost feature importances (top 15) ===")
     importances = pd.Series(final.feature_importances_, index=feat_cols).sort_values(ascending=False)
     print(importances.head(15).to_string())
-    print(f"\n[done] wrote {len(out_df)} rows → {args.out}")
+    print(f"\n[done] wrote {len(out_df)} rows (XGB {args.output}) → {args.out}")
     print(out_df.describe())
+
+    # ---- Optional: also fit a logistic regression and emit a second CSV ----
+    if args.also_emit_lr:
+        print("\n=== Fitting logistic regression (L2-regularized) ===")
+        # Standardize: LR is sensitive to feature scale.
+        scaler = StandardScaler()
+        X_shadow_s = scaler.fit_transform(X_shadow)
+        X_real_s = scaler.transform(X_real)
+
+        # CV to estimate LR's generalization within shadows.
+        fold_aucs_lr = []
+        for fi, (tr_idx, va_idx) in enumerate(skf.split(X_shadow_s, y_shadow)):
+            lr_cv = LogisticRegression(
+                C=1.0, max_iter=2000, penalty="l2", solver="lbfgs",
+                class_weight="balanced",
+            )
+            lr_cv.fit(X_shadow_s[tr_idx], y_shadow[tr_idx])
+            p_lr = lr_cv.predict_proba(X_shadow_s[va_idx])[:, 1]
+            fold_aucs_lr.append(roc_auc_score(y_shadow[va_idx], p_lr))
+            print(f"  fold {fi}: AUC={fold_aucs_lr[-1]:.4f}")
+        print(f"  mean AUC={np.mean(fold_aucs_lr):.4f}  std={np.std(fold_aucs_lr):.4f}")
+
+        lr_final = LogisticRegression(
+            C=1.0, max_iter=2000, penalty="l2", solver="lbfgs",
+            class_weight="balanced",
+        )
+        lr_final.fit(X_shadow_s, y_shadow)
+        # Use decision_function (raw score) — smoother than predict_proba for ranking
+        lr_scores = lr_final.decision_function(X_real_s)
+        lr_out = pd.DataFrame({"id": real_df["suspect_id"].astype(int),
+                               "score": lr_scores.astype(float)})
+        lr_out = lr_out.sort_values("id").reset_index(drop=True)
+        assert len(lr_out) == 360
+        assert lr_out["id"].is_unique
+        assert np.isfinite(lr_out["score"].values).all()
+        lr_out_path = str(Path(args.out).with_name(
+            Path(args.out).stem + "_lr.csv"
+        ))
+        lr_out.to_csv(lr_out_path, index=False)
+
+        print(f"\n=== LR top-15 coefficients (signed; higher → more stolen) ===")
+        lr_coef = pd.Series(lr_final.coef_[0], index=feat_cols).sort_values(
+            key=lambda s: s.abs(), ascending=False
+        )
+        print(lr_coef.head(15).to_string())
+        print(f"\n[done] wrote {len(lr_out)} rows (LR decision fn) → {lr_out_path}")
+        print(lr_out.describe())
 
 
 if __name__ == "__main__":

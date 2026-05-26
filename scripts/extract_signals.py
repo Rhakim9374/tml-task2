@@ -33,6 +33,11 @@ from src.data import (
 from src.model import load_weights, make_model
 from src.signals.cka import cka_features
 from src.signals.dataset_inference import gap_features, split_features
+from src.signals.ddv import (
+    compute_ddv,
+    ddv_similarity_features,
+    make_directions,
+)
 from src.signals.decision_boundary import grad_and_adv_features
 from src.signals.output_agreement import (
     agreement_features,
@@ -101,6 +106,16 @@ def parse_args() -> argparse.Namespace:
                    help="number of probe examples per split for S5 grad/adv features")
     p.add_argument("--grad-epsilon", type=float, default=0.06,
                    help="FGSM epsilon in normalized input space (default 0.06 ≈ 4/255 pixels)")
+    p.add_argument("--no-ddv", action="store_true",
+                   help="skip S6 decision-distance-vector features")
+    p.add_argument("--ddv-probe-n", type=int, default=128,
+                   help="number of probe examples per split for S6 DDV")
+    p.add_argument("--ddv-K", type=int, default=4,
+                   help="number of random directions per probe for S6 DDV")
+    p.add_argument("--ddv-n-steps", type=int, default=8,
+                   help="number of alpha steps in S6 DDV grid (log-spaced)")
+    p.add_argument("--ddv-alpha-max", type=float, default=0.2,
+                   help="maximum DDV perturbation magnitude in normalized input space")
     return p.parse_args()
 
 
@@ -148,6 +163,39 @@ def main():
         print(f"[probe] gathering grad/adv probes (n={args.grad_probe_n} per split)")
         for split, loader in loaders.items():
             grad_probes[split] = collect_first_images(loader, args.grad_probe_n)
+
+    # Per-split probe batches + cached target DDVs for S6. Target's DDV is
+    # the same for every suspect in this shard — compute once.
+    ddv_probes: dict[str, torch.Tensor] = {}
+    ddv_directions: dict[str, torch.Tensor] = {}
+    ddv_alphas = torch.linspace(args.ddv_alpha_max / args.ddv_n_steps,
+                                args.ddv_alpha_max, args.ddv_n_steps,
+                                device=device) if not args.no_ddv else None
+    target_ddvs: dict[str, torch.Tensor] = {}
+    target_pred_ddv: dict[str, torch.Tensor] = {}
+    if not args.no_ddv:
+        print(f"[probe] gathering DDV probes (n={args.ddv_probe_n}, K={args.ddv_K}, "
+              f"n_steps={args.ddv_n_steps}, alpha_max={args.ddv_alpha_max})")
+        for split, loader in loaders.items():
+            probe = collect_first_images(loader, args.ddv_probe_n)
+            ddv_probes[split] = probe.to(device)
+            ddv_directions[split] = make_directions(
+                probe.size(0), args.ddv_K,
+                tuple(probe.shape[1:]),
+                seed=hash(split) & 0xFFFF_FFFF,
+                device=device,
+            )
+            with torch.no_grad():
+                target_pred_ddv[split] = target(ddv_probes[split]).argmax(dim=1)
+        print(f"[target] computing DDV cache (this runs once per shard) ...")
+        t0 = time.time()
+        for split in ddv_probes:
+            target_ddvs[split] = compute_ddv(
+                target, ddv_probes[split], target_pred_ddv[split],
+                ddv_directions[split], ddv_alphas, device,
+            )
+        print(f"[target] DDV cache built in {time.time() - t0:.1f}s "
+              f"({len(target_ddvs)} splits × {args.ddv_probe_n} probes × {args.ddv_K} dirs)")
 
     # free target weights from GPU between uses to keep memory low (we keep on CPU between suspects)
     # but for S3 alignment we re-call its forward, so keep on GPU
@@ -207,6 +255,26 @@ def main():
                         s5[f"s5_grad_cos_{split}"] = 0.0
                         s5[f"s5_adv_transfer_{split}"] = 0.0
 
+            # === S6 Decision-Distance Vector similarity (uses cached target DDV) ===
+            s6 = {}
+            if not args.no_ddv:
+                for split in ddv_probes:
+                    try:
+                        suspect_ddv = compute_ddv(
+                            suspect, ddv_probes[split], target_pred_ddv[split],
+                            ddv_directions[split], ddv_alphas, device,
+                        )
+                        s6.update(ddv_similarity_features(
+                            target_ddvs[split], suspect_ddv,
+                            prefix=split, alpha_max=args.ddv_alpha_max,
+                        ))
+                    except Exception as e:
+                        print(f"[suspect {i:3d}] DDV on {split} failed ({e}); "
+                              f"writing 0.0 fallback", flush=True)
+                        s6[f"s6_ddv_corr_{split}"] = 0.0
+                        s6[f"s6_ddv_cos_{split}"] = 0.0
+                        s6[f"s6_ddv_flip_agree_{split}"] = 0.0
+
             # === S3 weight features ===
             s3 = {}
             s3.update(raw_weight_features(target, suspect))
@@ -222,7 +290,7 @@ def main():
                     s3["s3_perm_l2"] = s3["s3_raw_l2"]
                     s3["s3_perm_cos"] = s3["s3_raw_cos"]
 
-            row = {"suspect_id": i, **s1, **s1f, **s2, **s3, **s4, **s5}
+            row = {"suspect_id": i, **s1, **s1f, **s2, **s3, **s4, **s5, **s6}
             rows.append(row)
         except Exception as e:
             print(f"[suspect {i:3d}] FAILED ({type(e).__name__}: {e}); skipping", flush=True)

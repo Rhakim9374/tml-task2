@@ -42,12 +42,39 @@ def make_model() -> nn.Module:
     return m
 
 
-def get_transforms() -> tuple[transforms.Compose, transforms.Compose]:
-    # Matches the target's recipe from the assignment PDF: hflip + biased crop
-    # (bias_x=0.5, bias_y=-0.25, jitter=0.25, reflect-pad=4) + standard normalize.
-    train_tfm = transforms.Compose([
-        transforms.RandomHorizontalFlip(p=0.5),
-        BiasedRandomCrop(size=32, pad=4, bias_x=0.5, bias_y=-0.25, jitter=0.25),
+def get_transforms(kind: str = "target") -> tuple[transforms.Compose, transforms.Compose]:
+    """Train-time augmentation pipeline. `kind` controls how aggressive it is.
+
+    target   -- target's exact recipe (biased crop bias_x=0.5, bias_y=-0.25,
+                jitter=0.25 + reflect-pad-4 + hflip). For shadows that should
+                look "produced under target's training conditions".
+    standard -- plain RandomCrop(32, pad=4) + hflip. Most public CIFAR recipes
+                use this; produces shadows that drift from target's recipe.
+    strong   -- standard + colorjitter; aggressive augmentation that some
+                independents would use.
+    none     -- no augmentation. Tests undertrained / overfit models.
+    """
+    if kind == "target":
+        train_aug = [
+            transforms.RandomHorizontalFlip(p=0.5),
+            BiasedRandomCrop(size=32, pad=4, bias_x=0.5, bias_y=-0.25, jitter=0.25),
+        ]
+    elif kind == "standard":
+        train_aug = [
+            transforms.RandomCrop(32, padding=4, padding_mode="reflect"),
+            transforms.RandomHorizontalFlip(p=0.5),
+        ]
+    elif kind == "strong":
+        train_aug = [
+            transforms.RandomCrop(32, padding=4, padding_mode="reflect"),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        ]
+    elif kind == "none":
+        train_aug = []
+    else:
+        raise ValueError(f"unknown augmentation kind: {kind}")
+    train_tfm = transforms.Compose(train_aug + [
         transforms.ToTensor(),
         transforms.Normalize(CIFAR100_MEAN, CIFAR100_STD),
     ])
@@ -58,32 +85,72 @@ def get_transforms() -> tuple[transforms.Compose, transforms.Compose]:
     return train_tfm, eval_tfm
 
 
+def get_train_set(train_tfm, data_root: str, dataset_name: str = "cifar100-train"):
+    """Return a CIFAR dataset by short name.
+
+    Used to vary the *distillation transfer set* — distilled stolen models
+    in the real world are often trained on a different dataset than the
+    target (e.g., OOD transfer). Modelling that here:
+        cifar100-train  same data target was trained on (50k images, 100 classes)
+        cifar100-test   CIFAR-100 test split (10k images, 100 classes)
+        cifar10-train   CIFAR-10 (50k images, 10 classes — labels ignored in distill)
+    """
+    if dataset_name == "cifar100-train":
+        return datasets.CIFAR100(root=data_root, train=True, download=True, transform=train_tfm)
+    if dataset_name == "cifar100-test":
+        return datasets.CIFAR100(root=data_root, train=False, download=True, transform=train_tfm)
+    if dataset_name == "cifar10-train":
+        cifar10_root = data_root.replace("cifar100_data", "cifar10_data")
+        return datasets.CIFAR10(root=cifar10_root, train=True, download=True, transform=train_tfm)
+    raise ValueError(f"unknown distill dataset: {dataset_name}")
+
+
 def kd_loss(student_logits: torch.Tensor, teacher_logits: torch.Tensor, T: float) -> torch.Tensor:
     s = F.log_softmax(student_logits / T, dim=-1)
     t = F.log_softmax(teacher_logits / T, dim=-1)
     return F.kl_div(s, t, reduction="batchmean", log_target=True) * (T * T)
 
 
-def train_one_epoch(model, loader, opt, device, teacher=None, T=4.0):
+def train_one_epoch(model, loader, opt, device, teacher=None, T=4.0,
+                    label_smoothing: float = 0.0, kd_weight: float = 1.0):
+    """Train one epoch.
+
+    kd_weight controls the loss mix when teacher is set:
+        1.0 → pure distillation (KD only)
+        0.0 → pure CE (effectively no distillation; only meaningful if teacher is None)
+        0<α<1 → mixed: α·KD + (1-α)·CE     ← used for the boundary "mixed_kd" kind
+    """
     model.train()
     total_loss = 0.0
     correct = 0
     n = 0
-    for x, y in loader:
+    for batch in loader:
+        x = batch[0] if isinstance(batch, (list, tuple)) else batch
+        y = batch[1] if isinstance(batch, (list, tuple)) and len(batch) > 1 else None
         x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
+        if y is not None:
+            y = y.to(device, non_blocking=True)
         opt.zero_grad(set_to_none=True)
         logits = model(x)
         if teacher is not None:
             with torch.no_grad():
                 t_logits = teacher(x)
-            loss = kd_loss(logits, t_logits, T)
+            l_kd = kd_loss(logits, t_logits, T)
+            if kd_weight >= 1.0 or y is None:
+                loss = l_kd
+                with torch.no_grad():
+                    correct += (logits.argmax(-1) == t_logits.argmax(-1)).sum().item()
+            else:
+                l_ce = F.cross_entropy(logits, y, label_smoothing=label_smoothing)
+                loss = kd_weight * l_kd + (1.0 - kd_weight) * l_ce
+                with torch.no_grad():
+                    correct += (logits.argmax(-1) == y).sum().item()
         else:
-            loss = F.cross_entropy(logits, y)
+            loss = F.cross_entropy(logits, y, label_smoothing=label_smoothing)
+            correct += (logits.argmax(-1) == y).sum().item()
         loss.backward()
         opt.step()
         total_loss += loss.item() * x.size(0)
-        correct += (logits.argmax(-1) == y).sum().item()
         n += x.size(0)
     return total_loss / n, correct / n
 
@@ -105,7 +172,10 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--mode", choices=["train", "distill"], default="train")
+    ap.add_argument("--mode", choices=["train", "distill", "mixed_kd"], default="train",
+                    help="train=CE only; distill=KD only; mixed_kd=alpha·KD + (1-alpha)·CE")
+    ap.add_argument("--kd-weight", type=float, default=0.5,
+                    help="for mode=mixed_kd, the weight on the KD loss (0=CE-only, 1=KD-only)")
     ap.add_argument("--train-indices-json", default=None,
                     help="JSON list of CIFAR-100 train indices; if absent, sample 40k by --seed")
     ap.add_argument("--save-indices", default=None,
@@ -131,6 +201,16 @@ def main() -> None:
     ap.add_argument("--data-root", default="./cifar100_data")
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--label-smoothing", type=float, default=0.0,
+                    help="cross-entropy label smoothing (target uses 0.0)")
+    ap.add_argument("--optimizer", default="sgd", choices=["sgd", "adamw"])
+    ap.add_argument("--augmentation", default="target",
+                    choices=["target", "standard", "strong", "none"],
+                    help="train-time augmentation: target=biased-crop (matches target), "
+                         "standard=plain RandomCrop+hflip, strong=+colorjitter, none=none")
+    ap.add_argument("--distill-dataset", default="cifar100-train",
+                    choices=["cifar100-train", "cifar100-test", "cifar10-train"],
+                    help="transfer set for distillation (default cifar100-train)")
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -139,16 +219,29 @@ def main() -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    train_tfm, eval_tfm = get_transforms()
-    train_full = datasets.CIFAR100(root=args.data_root, train=True, download=True, transform=train_tfm)
+    train_tfm, eval_tfm = get_transforms(kind=args.augmentation)
+    print(f"[aug] using augmentation kind: {args.augmentation}", flush=True)
+
+    if args.mode == "distill" and args.distill_dataset != "cifar100-train":
+        # Distillation transfer set may differ from target's training data.
+        train_full = get_train_set(train_tfm, args.data_root, args.distill_dataset)
+        print(f"[distill] transfer set: {args.distill_dataset} ({len(train_full)} samples)", flush=True)
+        # subset only applies when using cifar100-train (40k-of-50k); otherwise use all
+        indices = list(range(len(train_full))) if args.distill_dataset != "cifar100-train" else None
+    else:
+        train_full = datasets.CIFAR100(root=args.data_root, train=True, download=True, transform=train_tfm)
+        indices = None
+
     test_full = datasets.CIFAR100(root=args.data_root, train=False, download=True, transform=eval_tfm)
 
-    if args.train_indices_json and Path(args.train_indices_json).exists():
-        with open(args.train_indices_json) as f:
-            indices = json.load(f)
-    else:
-        rng = np.random.default_rng(args.seed)
-        indices = rng.choice(len(train_full), size=args.num_train, replace=False).tolist()
+    if indices is None:
+        if args.train_indices_json and Path(args.train_indices_json).exists():
+            with open(args.train_indices_json) as f:
+                indices = json.load(f)
+        else:
+            rng = np.random.default_rng(args.seed)
+            indices = rng.choice(len(train_full), size=min(args.num_train, len(train_full)),
+                                 replace=False).tolist()
 
     if args.save_indices:
         Path(args.save_indices).parent.mkdir(parents=True, exist_ok=True)
@@ -183,24 +276,33 @@ def main() -> None:
               f"({n_train:,} params trainable, {n_freeze:,} frozen)", flush=True)
 
     teacher = None
-    if args.mode == "distill":
+    if args.mode in ("distill", "mixed_kd"):
         if not args.distill_target:
-            raise ValueError("--distill-target required for distill mode")
+            raise ValueError(f"--distill-target required for mode={args.mode}")
         teacher = make_model().to(args.device)
         teacher.load_state_dict(load_file(args.distill_target), strict=True)
         teacher.eval()
-        print(f"[distill] teacher loaded from {args.distill_target}", flush=True)
+        kdw = 1.0 if args.mode == "distill" else args.kd_weight
+        print(f"[{args.mode}] teacher from {args.distill_target} (kd_weight={kdw})", flush=True)
 
     # Only optimize parameters that aren't frozen (matters for --freeze-except).
     trainable = [p for p in model.parameters() if p.requires_grad]
-    opt = torch.optim.SGD(trainable, lr=args.lr, momentum=args.momentum,
-                          weight_decay=args.weight_decay, nesterov=args.nesterov)
+    if args.optimizer == "adamw":
+        opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        opt = torch.optim.SGD(trainable, lr=args.lr, momentum=args.momentum,
+                              weight_decay=args.weight_decay, nesterov=args.nesterov)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
     t0 = time.time()
+    kdw_run = 1.0 if args.mode == "distill" else (args.kd_weight if args.mode == "mixed_kd" else 0.0)
     for ep in range(args.epochs):
-        tr_loss, tr_acc = train_one_epoch(model, train_loader, opt, args.device,
-                                          teacher=teacher, T=args.distill_temp)
+        tr_loss, tr_acc = train_one_epoch(
+            model, train_loader, opt, args.device,
+            teacher=teacher, T=args.distill_temp,
+            label_smoothing=args.label_smoothing,
+            kd_weight=kdw_run,
+        )
         sched.step()
         if ep % 5 == 0 or ep == args.epochs - 1:
             te_acc = evaluate(model, test_loader, args.device)

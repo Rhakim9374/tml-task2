@@ -62,6 +62,13 @@ GROUPS: dict[str, list[str]] = {
         "s5_adv_transfer_train", "s5_adv_transfer_holdout",
         "s5_adv_transfer_test", "s5_adv_transfer_ood",
     ],
+    "S6": [
+        # ModelDiff-style decision-distance vector (DDV) similarity
+        "s6_ddv_corr_train", "s6_ddv_corr_holdout", "s6_ddv_corr_test", "s6_ddv_corr_ood",
+        "s6_ddv_cos_train", "s6_ddv_cos_holdout", "s6_ddv_cos_test", "s6_ddv_cos_ood",
+        "s6_ddv_flip_agree_train", "s6_ddv_flip_agree_holdout",
+        "s6_ddv_flip_agree_test", "s6_ddv_flip_agree_ood",
+    ],
 }
 
 
@@ -80,7 +87,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", default="submissions/submission.csv")
     p.add_argument(
         "--groups",
-        default="S1,S1f,S2,S3,S4,S5",
+        default="S1,S1f,S2,S3,S4,S5,S6",
         help="comma-separated subset of groups to include in the ensemble",
     )
     p.add_argument(
