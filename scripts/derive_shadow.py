@@ -23,6 +23,12 @@ def add_noise(sd: dict[str, torch.Tensor], scale: float, seed: int) -> dict[str,
     g = torch.Generator().manual_seed(seed)
     out = {}
     for k, v in sd.items():
+        # NEVER perturb BatchNorm running stats — perturbing running_var pushes
+        # it near or below zero, causing division by ~0 and NaN activations
+        # downstream. These aren't learnable parameters, they're statistics.
+        if "running_mean" in k or "running_var" in k or "num_batches_tracked" in k:
+            out[k] = v.clone()
+            continue
         if v.dtype.is_floating_point and v.numel() > 1:
             std = v.std().item() if v.std().item() > 0 else 1e-6
             noise = torch.randn(v.shape, generator=g, dtype=v.dtype) * (std * scale)
