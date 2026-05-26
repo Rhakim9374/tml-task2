@@ -31,6 +31,15 @@ GROUPS: dict[str, list[str]] = {
         "s1_cos_test", "s1_nkl_t_s_test", "s1_nl2_prob_test", "s1_top1_test",
         "s1_cos_ood", "s1_nkl_t_s_ood", "s1_nl2_prob_ood", "s1_top1_ood",
     ],
+    "S1f": [
+        # fine-grained agreement: mistake-copying, top-k overlap, low-confidence agreement
+        "s1_mistake_train", "s1_mistake_holdout", "s1_mistake_test",
+        "s1_top3_overlap_train", "s1_top3_overlap_holdout",
+        "s1_top3_overlap_test", "s1_top3_overlap_ood",
+        "s1_top5_overlap_train", "s1_top5_overlap_holdout",
+        "s1_top5_overlap_test", "s1_top5_overlap_ood",
+        "s1_low_conf_agree_train", "s1_low_conf_agree_holdout", "s1_low_conf_agree_test",
+    ],
     "S2": [
         "s2_loss_gap_h_t",
         "s2_loss_gap_te_t",
@@ -45,6 +54,13 @@ GROUPS: dict[str, list[str]] = {
         "s4_cka_stem",
         "s4_cka_layer1", "s4_cka_layer2", "s4_cka_layer3", "s4_cka_layer4",
         "s4_cka_penult", "s4_cka_mean",
+    ],
+    "S5": [
+        # decision-boundary fingerprint: input-gradient cosine + FGSM transfer rate
+        "s5_grad_cos_train", "s5_grad_cos_holdout",
+        "s5_grad_cos_test", "s5_grad_cos_ood",
+        "s5_adv_transfer_train", "s5_adv_transfer_holdout",
+        "s5_adv_transfer_test", "s5_adv_transfer_ood",
     ],
 }
 
@@ -64,7 +80,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", default="submissions/submission.csv")
     p.add_argument(
         "--groups",
-        default="S1,S2,S3,S4",
+        default="S1,S1f,S2,S3,S4,S5",
         help="comma-separated subset of groups to include in the ensemble",
     )
     p.add_argument(

@@ -28,6 +28,8 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 from torchvision.models import resnet18
 
+from src.data import BiasedRandomCrop  # target's exact bias_x=0.5, bias_y=-0.25 recipe
+
 CIFAR100_MEAN = (0.5071, 0.4867, 0.4408)
 CIFAR100_STD = (0.2675, 0.2565, 0.2761)
 
@@ -41,9 +43,11 @@ def make_model() -> nn.Module:
 
 
 def get_transforms() -> tuple[transforms.Compose, transforms.Compose]:
+    # Matches the target's recipe from the assignment PDF: hflip + biased crop
+    # (bias_x=0.5, bias_y=-0.25, jitter=0.25, reflect-pad=4) + standard normalize.
     train_tfm = transforms.Compose([
-        transforms.RandomCrop(32, padding=4, padding_mode="reflect"),
-        transforms.RandomHorizontalFlip(),
+        transforms.RandomHorizontalFlip(p=0.5),
+        BiasedRandomCrop(size=32, pad=4, bias_x=0.5, bias_y=-0.25, jitter=0.25),
         transforms.ToTensor(),
         transforms.Normalize(CIFAR100_MEAN, CIFAR100_STD),
     ])
@@ -108,12 +112,19 @@ def main() -> None:
                     help="if set, also write the chosen train indices to this path")
     ap.add_argument("--num-train", type=int, default=40000)
     ap.add_argument("--epochs", type=int, default=30)
-    ap.add_argument("--batch-size", type=int, default=128)
+    # Target's recipe uses batch_size=256, lr=0.1, SGD momentum=0.9, wd=5e-4, cosine.
+    ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--lr", type=float, default=0.1)
     ap.add_argument("--momentum", type=float, default=0.9)
     ap.add_argument("--weight-decay", type=float, default=5e-4)
+    ap.add_argument("--nesterov", action="store_true",
+                    help="enable Nesterov momentum (off by default — target spec doesn't specify)")
     ap.add_argument("--init-from", default=None,
                     help="safetensors path to initialize from (fine-tuning)")
+    ap.add_argument("--freeze-except", default=None,
+                    help="comma-separated submodule prefixes to keep trainable; "
+                         "all others get requires_grad=False. E.g. 'fc' for last-layer-only "
+                         "fine-tuning, 'fc,layer4' to also unfreeze the final residual block.")
     ap.add_argument("--distill-target", default=None,
                     help="safetensors path to the teacher (used in distill mode)")
     ap.add_argument("--distill-temp", type=float, default=4.0)
@@ -156,6 +167,21 @@ def main() -> None:
         model.load_state_dict(sd, strict=True)
         print(f"[init] loaded {args.init_from}", flush=True)
 
+    if args.freeze_except:
+        trainable_prefixes = {s.strip() for s in args.freeze_except.split(",") if s.strip()}
+        n_train = 0
+        n_freeze = 0
+        for name, param in model.named_parameters():
+            top = name.split(".")[0]
+            if top in trainable_prefixes:
+                param.requires_grad_(True)
+                n_train += param.numel()
+            else:
+                param.requires_grad_(False)
+                n_freeze += param.numel()
+        print(f"[freeze] kept trainable: {sorted(trainable_prefixes)} "
+              f"({n_train:,} params trainable, {n_freeze:,} frozen)", flush=True)
+
     teacher = None
     if args.mode == "distill":
         if not args.distill_target:
@@ -165,8 +191,10 @@ def main() -> None:
         teacher.eval()
         print(f"[distill] teacher loaded from {args.distill_target}", flush=True)
 
-    opt = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum,
-                          weight_decay=args.weight_decay, nesterov=True)
+    # Only optimize parameters that aren't frozen (matters for --freeze-except).
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.SGD(trainable, lr=args.lr, momentum=args.momentum,
+                          weight_decay=args.weight_decay, nesterov=args.nesterov)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
     t0 = time.time()

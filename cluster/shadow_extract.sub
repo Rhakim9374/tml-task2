@@ -1,8 +1,8 @@
 universe       = docker
 docker_image   = pytorch/pytorch:2.3.1-cuda12.1-cudnn8-devel
 executable     = /bin/bash
-# args: SHARD_IDX  NUM_SHARDS  TOTAL_SHADOWS  (40 suspects total → 4 shards × 10)
-arguments      = /home/$ENV(USER)/code/cluster/run_shadow_extract.sh $(Process) 4 40
+# args: SHARD_IDX  NUM_SHARDS  TOTAL_SHADOWS  (70 shadows → 14 shards × 5)
+arguments      = /home/$ENV(USER)/code/cluster/run_shadow_extract.sh $(Process) 14 70
 output         = runlogs/shadow_extract.$(ClusterId).$(Process).out
 error          = runlogs/shadow_extract.$(ClusterId).$(Process).err
 log            = runlogs/shadow_extract.$(ClusterId).log
@@ -13,4 +13,4 @@ request_memory = 16G
 requirements   = UidDomain == "cs.uni-saarland.de"
 +WantGPUHomeMounted = true
 +WantScratchMounted = true
-queue 4
+queue 14

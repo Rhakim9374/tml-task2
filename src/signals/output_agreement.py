@@ -67,3 +67,84 @@ def agreement_features(
         f"s1_nl2_prob_{prefix}": float(-l2_prob),  # negate so higher = more agree
         f"s1_top1_{prefix}": float(top1),
     }
+
+
+# --------------------------------------------------------------------------
+# Fine-grained agreement (added 2026-05-26): mistake / top-K / low-confidence
+# --------------------------------------------------------------------------
+#
+# Independents converge to *different* solutions even on identical training
+# data (different random init → different local minimum). They agree with the
+# target on easy examples (everyone gets those right) but disagree on the hard
+# ones. Stolen models — especially distilled — inherit the target's idiosyncratic
+# behavior on those exact hard examples. These three features isolate the
+# discriminative subset.
+
+
+def mistake_agreement_features(
+    target_logits: torch.Tensor,
+    suspect_logits: torch.Tensor,
+    labels: torch.Tensor,
+    prefix: str,
+) -> dict[str, float]:
+    """Agreement *only* on inputs where target is wrong.
+
+    Strongest fingerprinting signal we have: a stolen model copies the
+    target's wrong predictions; an independent model makes different mistakes.
+    """
+    target_pred = target_logits.argmax(dim=1)
+    suspect_pred = suspect_logits.argmax(dim=1)
+    mistake_mask = (target_pred != labels)
+    n_mistakes = int(mistake_mask.sum().item())
+    if n_mistakes == 0:
+        # Target perfect on this probe — degenerate; default to 1.0 (most-stolen).
+        return {f"s1_mistake_{prefix}": 1.0, f"s1_mistake_{prefix}_n": 0.0}
+    agree = (suspect_pred[mistake_mask] == target_pred[mistake_mask]).float().mean().item()
+    return {f"s1_mistake_{prefix}": float(agree),
+            f"s1_mistake_{prefix}_n": float(n_mistakes)}
+
+
+def topk_overlap_features(
+    target_logits: torch.Tensor,
+    suspect_logits: torch.Tensor,
+    prefix: str,
+) -> dict[str, float]:
+    """Top-3 and top-5 overlap of target vs suspect predictions.
+
+    Catches "secondary preferences" — even when the top-1 differs, distilled
+    students inherit the target's *runner-up* classes; independents have
+    different runner-ups.
+    """
+    out: dict[str, float] = {}
+    for k in (3, 5):
+        t_topk = target_logits.topk(k, dim=1).indices  # [N, k]
+        s_topk = suspect_logits.topk(k, dim=1).indices  # [N, k]
+        # For each row, count how many of target's top-k appear in suspect's top-k.
+        match = (t_topk.unsqueeze(2) == s_topk.unsqueeze(1)).any(dim=2).float()  # [N, k]
+        overlap = match.mean(dim=1).mean().item()  # mean over rows of fraction-matched
+        out[f"s1_top{k}_overlap_{prefix}"] = float(overlap)
+    return out
+
+
+def low_conf_agreement_features(
+    target_logits: torch.Tensor,
+    suspect_logits: torch.Tensor,
+    prefix: str,
+    threshold: float = 0.5,
+) -> dict[str, float]:
+    """Agreement only where target's max softmax probability is below `threshold`.
+
+    Where target hedges, the chosen class is idiosyncratic (multiple plausible
+    classes; target picked one). Stolen models inherit this confusion structure;
+    independents resolve differently.
+    """
+    target_probs = F.softmax(target_logits, dim=1)
+    target_max = target_probs.max(dim=1).values
+    target_pred = target_logits.argmax(dim=1)
+    suspect_pred = suspect_logits.argmax(dim=1)
+    mask = (target_max < threshold)
+    n_low = int(mask.sum().item())
+    if n_low == 0:
+        return {f"s1_low_conf_agree_{prefix}": 1.0}
+    agree = (suspect_pred[mask] == target_pred[mask]).float().mean().item()
+    return {f"s1_low_conf_agree_{prefix}": float(agree)}

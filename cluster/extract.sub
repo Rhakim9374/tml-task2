@@ -1,8 +1,9 @@
 universe       = docker
 docker_image   = pytorch/pytorch:2.3.1-cuda12.1-cudnn8-devel
 executable     = /bin/bash
-# Edit the second arg AND `queue N` together to change shard count (e.g., 24).
-arguments      = /home/$ENV(USER)/code/cluster/run_shard.sh $(Process) 12
+# Edit the second arg AND `queue N` together to change shard count.
+# 18 shards × 20 suspects each = 360 (uses up to 18 GPUs in parallel).
+arguments      = /home/$ENV(USER)/code/cluster/run_shard.sh $(Process) 18
 output         = runlogs/shard.$(ClusterId).$(Process).out
 error          = runlogs/shard.$(ClusterId).$(Process).err
 log            = runlogs/shard.$(ClusterId).log
@@ -13,4 +14,4 @@ request_memory = 16G
 requirements   = UidDomain == "cs.uni-saarland.de"
 +WantGPUHomeMounted = true
 +WantScratchMounted = true
-queue 12
+queue 18

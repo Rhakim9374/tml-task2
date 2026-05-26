@@ -33,7 +33,14 @@ from src.data import (
 from src.model import load_weights, make_model
 from src.signals.cka import cka_features
 from src.signals.dataset_inference import gap_features, split_features
-from src.signals.output_agreement import agreement_features, forward_logits
+from src.signals.decision_boundary import grad_and_adv_features
+from src.signals.output_agreement import (
+    agreement_features,
+    forward_logits,
+    low_conf_agreement_features,
+    mistake_agreement_features,
+    topk_overlap_features,
+)
 from src.signals.weight_align import (
     align_suspect_to_target,
     aligned_weight_features,
@@ -88,6 +95,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", default="checkpoints/features.csv")
     p.add_argument("--no-ood", action="store_true", help="skip OOD probe (S1 only)")
     p.add_argument("--no-align", action="store_true", help="skip S3 permutation alignment")
+    p.add_argument("--no-grad", action="store_true",
+                   help="skip S5 input-gradient + adversarial-transfer features")
+    p.add_argument("--grad-probe-n", type=int, default=256,
+                   help="number of probe examples per split for S5 grad/adv features")
+    p.add_argument("--grad-epsilon", type=float, default=0.06,
+                   help="FGSM epsilon in normalized input space (default 0.06 ≈ 4/255 pixels)")
     return p.parse_args()
 
 
@@ -128,6 +141,14 @@ def main():
     align_probe = collect_first_images(loaders["test"], args.align_probe_n)
     cka_probe = collect_first_images(loaders["test"], args.cka_probe_n)
 
+    # Per-split probe batches for S5 grad/adv features. Same examples re-used
+    # across all suspects so the gradient direction comparison is consistent.
+    grad_probes: dict[str, torch.Tensor] = {}
+    if not args.no_grad:
+        print(f"[probe] gathering grad/adv probes (n={args.grad_probe_n} per split)")
+        for split, loader in loaders.items():
+            grad_probes[split] = collect_first_images(loader, args.grad_probe_n)
+
     # free target weights from GPU between uses to keep memory low (we keep on CPU between suspects)
     # but for S3 alignment we re-call its forward, so keep on GPU
     target.to(device)
@@ -148,10 +169,20 @@ def main():
             for split, loader in loaders.items():
                 susp_logits[split] = forward_logits(suspect, loader, device)
 
-            # === S1 output agreement ===
+            # === S1 output agreement (existing) ===
             s1 = {}
             for split in loaders.keys():
                 s1.update(agreement_features(target_logits[split], susp_logits[split], prefix=split))
+
+            # === S1f fine-grained agreement (mistake / top-k / low-conf) ===
+            s1f = {}
+            for split in loaders.keys():
+                s1f.update(topk_overlap_features(target_logits[split], susp_logits[split], prefix=split))
+            for split in ["train", "holdout", "test"]:
+                s1f.update(mistake_agreement_features(
+                    target_logits[split], susp_logits[split], labels[split], prefix=split))
+                s1f.update(low_conf_agreement_features(
+                    target_logits[split], susp_logits[split], prefix=split))
 
             # === S2 dataset inference ===
             s2_per = {}
@@ -161,6 +192,20 @@ def main():
 
             # === S4 CKA (pristine suspect — do BEFORE alignment mutation) ===
             s4 = cka_features(target, suspect, cka_probe, device)
+
+            # === S5 decision-boundary similarity (pristine suspect) ===
+            s5 = {}
+            if not args.no_grad:
+                for split, probe in grad_probes.items():
+                    try:
+                        s5.update(grad_and_adv_features(
+                            target, suspect, probe, device,
+                            prefix=split, epsilon=args.grad_epsilon))
+                    except Exception as e:
+                        print(f"[suspect {i:3d}] grad/adv on {split} failed ({e}); "
+                              f"writing 0.0 fallback", flush=True)
+                        s5[f"s5_grad_cos_{split}"] = 0.0
+                        s5[f"s5_adv_transfer_{split}"] = 0.0
 
             # === S3 weight features ===
             s3 = {}
@@ -177,7 +222,7 @@ def main():
                     s3["s3_perm_l2"] = s3["s3_raw_l2"]
                     s3["s3_perm_cos"] = s3["s3_raw_cos"]
 
-            row = {"suspect_id": i, **s1, **s2, **s3, **s4}
+            row = {"suspect_id": i, **s1, **s1f, **s2, **s3, **s4, **s5}
             rows.append(row)
         except Exception as e:
             print(f"[suspect {i:3d}] FAILED ({type(e).__name__}: {e}); skipping", flush=True)

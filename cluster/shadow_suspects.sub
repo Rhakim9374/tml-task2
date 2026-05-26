@@ -12,6 +12,7 @@ request_memory = 16G
 requirements   = UidDomain == "cs.uni-saarland.de"
 +WantGPUHomeMounted = true
 +WantScratchMounted = true
-# 40 shadow suspects = 20 indep + 5 noise + 5 quant + 5 fine-tune + 5 distill
-# (matches default args of scripts/build_shadow_jobs.py)
-queue 40
+# 70 shadow suspects: 25 indep + 5 evil_twin + 10 fine_tune + 10 distill
+#                   + 10 partial_finetune + 5 noise + 5 quant
+# (matches scripts/build_shadow_jobs.py v2)
+queue 70
